@@ -1,0 +1,89 @@
+[preprocessing.py](https://github.com/user-attachments/files/33303436/preprocessing.py)
+"""
+Tiền xử lý + DataLoader cho bài toán segmentation (T4-T6).
+
+Cấu trúc thư mục dự kiến (sửa đường dẫn ở cuối file cho khớp dataset của nhóm):
+    data/
+      train/images/xxx.jpg      train/masks/xxx.png
+      val/images/yyy.jpg        val/masks/yyy.png
+Ảnh và mask ghép cặp theo TÊN FILE (không tính đuôi).
+"""
+import os
+import numpy as np
+import torch
+from PIL import Image
+from torch.utils.data import Dataset, DataLoader
+
+IMG_SIZE = 256          # chốt cùng nhóm ở T6
+BATCH_SIZE = 8          # 8 hoặc 16, chốt cùng nhóm ở T6
+USE_MEAN_STD = False    # False: chia 255 | True: chuẩn hóa mean/std (ImageNet)
+MEAN = (0.485, 0.456, 0.406)
+STD = (0.229, 0.224, 0.225)
+IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
+
+
+class SegDataset(Dataset):
+    def __init__(self, img_dir, mask_dir, size=IMG_SIZE, use_mean_std=USE_MEAN_STD):
+        self.img_dir, self.mask_dir = img_dir, mask_dir
+        self.size = size
+        self.use_mean_std = use_mean_std
+
+        masks = {os.path.splitext(f)[0]: f for f in os.listdir(mask_dir)
+                 if f.lower().endswith(IMG_EXTS)}
+        self.pairs = []
+        for f in sorted(os.listdir(img_dir)):
+            stem, ext = os.path.splitext(f)
+            if ext.lower() in IMG_EXTS and stem in masks:
+                self.pairs.append((f, masks[stem]))
+        if not self.pairs:
+            raise RuntimeError(f"Không ghép được cặp ảnh/mask nào giữa {img_dir} và {mask_dir}")
+
+        self.mean = torch.tensor(MEAN).view(3, 1, 1)
+        self.std = torch.tensor(STD).view(3, 1, 1)
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, idx):
+        img_name, mask_name = self.pairs[idx]
+        img = Image.open(os.path.join(self.img_dir, img_name)).convert("RGB")
+        mask = Image.open(os.path.join(self.mask_dir, mask_name))
+
+        # Ảnh: bilinear. Mask: nearest-neighbor (không nội suy, giữ nguyên nhãn).
+        img = img.resize((self.size, self.size), Image.BILINEAR)
+        mask = mask.resize((self.size, self.size), Image.NEAREST)
+
+        # Ảnh -> float32 [3,H,W], chia 255 (và tùy chọn mean/std)
+        img = torch.from_numpy(np.array(img, dtype=np.float32) / 255.0).permute(2, 0, 1)
+        if self.use_mean_std:
+            img = (img - self.mean) / self.std
+
+        # Mask -> long [H,W]
+        mask = torch.from_numpy(np.array(mask)).long()
+        if mask.ndim == 3:          # mask lưu dạng RGB/nhiều kênh -> lấy 1 kênh
+            mask = mask[..., 0]
+        return img, mask
+
+
+def get_dataloaders(root, batch_size=BATCH_SIZE, size=IMG_SIZE,
+                    use_mean_std=USE_MEAN_STD, num_workers=2):
+    train_ds = SegDataset(os.path.join(root, "train", "images"),
+                          os.path.join(root, "train", "masks"), size, use_mean_std)
+    val_ds = SegDataset(os.path.join(root, "val", "images"),
+                        os.path.join(root, "val", "masks"), size, use_mean_std)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                              num_workers=num_workers, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
+                            num_workers=num_workers, pin_memory=True)
+    return train_loader, val_loader
+
+
+if __name__ == "__main__":
+    DATA_ROOT = "data"   # <-- sửa cho khớp đường dẫn dataset của nhóm
+    train_loader, val_loader = get_dataloaders(DATA_ROOT)
+
+    images, masks = next(iter(train_loader))
+    print("Train batch  images:", tuple(images.shape), images.dtype)   # (B,3,256,256) float32
+    print("Train batch  masks :", tuple(masks.shape), masks.dtype)     # (B,256,256)   int64
+    print("Mask labels        :", masks.unique().tolist())
+    print("Số mẫu train/val   :", len(train_loader.dataset), "/", len(val_loader.dataset))
